@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SLC Data Dashboard</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="SLC Data">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#010101">
+<style>
+:root{--gold:#FFCC00;--ink:#010101;--grey:#4c4847;--paper:#f3f1ee}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--ink);color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-text-size-adjust:100%}
+body{padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+#home{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px 22px}
+h1{font-size:26px;line-height:1.15;margin:10px 0 4px;color:var(--gold);letter-spacing:.5px;text-transform:uppercase}
+.sub{color:#d8d5d2;font-size:14px;max-width:340px;line-height:1.5;margin:4px auto 22px}
+.logo{width:84px;height:84px;border-radius:18px}
+button,.btn{font:600 17px -apple-system,Helvetica,Arial,sans-serif;border:none;border-radius:12px;padding:15px 26px;background:var(--gold);color:var(--ink);cursor:pointer;display:inline-block}
+button.ghost{background:transparent;color:var(--gold);border:2px solid var(--gold);padding:11px 20px;font-size:15px}
+input[type=file]{display:none}
+.card{background:#1b1a1a;border-radius:14px;padding:16px 18px;margin-top:18px;max-width:360px;width:100%;text-align:left}
+.small{font-size:12.5px;color:#bdb9b5;line-height:1.5}
+.bar{height:12px;background:#333;border-radius:7px;overflow:hidden;margin:14px 0 8px}
+.bar i{display:block;height:100%;width:0;background:var(--gold);transition:width .35s ease}
+.bar.wait i{width:35%;animation:slide 1.3s ease-in-out infinite}
+@keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
+#stage{font-size:16px;font-weight:600}
+#err{color:#ffb3a8;font-size:14px;line-height:1.5}
+#viewer{display:none;position:fixed;inset:0;background:var(--paper);flex-direction:column}
+#viewbar{display:flex;align-items:center;gap:10px;background:var(--ink);padding:8px 12px;padding-top:calc(8px + env(safe-area-inset-top))}
+#viewbar button{padding:8px 14px;font-size:14px;border-radius:8px}
+#viewbar span{flex:1;font-size:12.5px;color:#d8d5d2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#frame{flex:1;width:100%;border:0;background:#fff}
+</style>
+</head>
+<body>
+<div id="home">
+  <img class="logo" src="icon-192.png" alt="">
+  <h1>SLC Data<br>Dashboard</h1>
+  <p class="sub">Pick your TracCloud visits export (.csv) and the dashboard is built right here on your phone. The file never leaves this device.</p>
+  <div id="pick">
+    <label class="btn" for="file">Choose CSV file</label>
+    <input id="file" type="file" accept=".csv,text/csv,text/comma-separated-values,application/vnd.ms-excel">
+  </div>
+  <div class="card" id="progress" style="display:none">
+    <div id="stage">Getting ready</div>
+    <div class="bar wait" id="bar"><i id="barfill"></i></div>
+    <div class="small" id="detail"></div>
+  </div>
+  <div class="card" id="errbox" style="display:none"><div id="err"></div></div>
+  <div class="card" id="last" style="display:none">
+    <div class="small" id="lastinfo"></div><div style="height:10px"></div>
+    <button class="ghost" id="openlast">Open last dashboard</button>
+  </div>
+  <p class="small" style="margin-top:22px;max-width:320px" id="firsttime">The first time, the app downloads about 45 MB of Python tools, then it opens offline.</p>
+</div>
+<div id="viewer">
+  <div id="viewbar"><button id="newfile">&lsaquo; New file</button><span id="viewname"></span></div>
+  <iframe id="frame" title="Dashboard"></iframe>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var worker = null, ready = false, queued = null, started = 0, tick = null, blobUrl = null;
+  // The service worker must be in charge BEFORE Python starts downloading, so every Python file gets saved for offline use.
+  var swReady = new Promise(function (resolve) {
+    if (!('serviceWorker' in navigator)) { resolve(); return; }
+    var timer = setTimeout(resolve, 6000);
+    navigator.serviceWorker.register('sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function () {
+      if (navigator.serviceWorker.controller) { clearTimeout(timer); resolve(); }
+      else { navigator.serviceWorker.addEventListener('controllerchange', function () { clearTimeout(timer); resolve(); }); }
+    }).catch(function () { clearTimeout(timer); resolve(); });
+  });
+
+  // ---- remember the last dashboard on this phone (IndexedDB, best effort) ----
+  function idb(mode, fn) {
+    return new Promise(function (resolve) {
+      try {
+        var req = indexedDB.open('slc-data', 1);
+        req.onupgradeneeded = function () { req.result.createObjectStore('kv'); };
+        req.onerror = function () { resolve(null); };
+        req.onsuccess = function () {
+          try {
+            var tx = req.result.transaction('kv', mode), out = fn(tx.objectStore('kv'));
+            tx.oncomplete = function () { resolve(out && out.result !== undefined ? out.result : null); };
+            tx.onerror = function () { resolve(null); };
+          } catch (e) { resolve(null); }
+        };
+      } catch (e) { resolve(null); }
+    });
+  }
+  function saveLast(html, name) { return idb('readwrite', function (s) { return s.put({ html: html, name: name, when: Date.now() }, 'last'); }); }
+  function loadLast() { return idb('readonly', function (s) { return s.get('last'); }); }
+
+  function show(id, on) { $(id).style.display = on ? '' : 'none'; }
+  function setBar(frac) {
+    var bar = $('bar');
+    if (frac === null) { bar.className = 'bar wait'; $('barfill').style.width = ''; }
+    else { bar.className = 'bar'; $('barfill').style.width = Math.round(frac * 100) + '%'; }
+  }
+  function elapsed() { return Math.round((Date.now() - started) / 1000); }
+  function startTicker() {
+    started = Date.now(); clearInterval(tick);
+    tick = setInterval(function () { $('detail').textContent = elapsed() + ' seconds so far. Keep this screen on and the app open.'; }, 1000);
+  }
+  function stopTicker() { clearInterval(tick); }
+
+  function startWorker() {
+    if (worker) return;
+    worker = new Worker('worker.js', { type: 'module' });
+    worker.onmessage = function (e) {
+      var m = e.data;
+      if (m.type === 'status') { $('stage').textContent = m.text + '…'; setBar(m.frac * 0.35); }
+      else if (m.type === 'ready') {
+        ready = true;
+        if (queued) { var q = queued; queued = null; send(q); }
+        else { show('progress', false); show('firsttime', false); }
+      }
+      else if (m.type === 'progress') { $('stage').textContent = m.label + '…'; setBar(0.35 + 0.65 * m.frac); }
+      else if (m.type === 'done') { stopTicker(); saveLast(m.html, m.name); openHtml(m.html, m.name); finishIdle(); }
+      else if (m.type === 'failed') { stopTicker(); finishIdle(); show('progress', false); $('err').textContent = m.text; show('errbox', true); }
+    };
+    worker.postMessage({ type: 'init' });
+  }
+  function finishIdle() { show('pick', true); }
+
+  function send(file) {
+    file.arrayBuffer().then(function (buf) {
+      $('stage').textContent = 'Reading your file…'; setBar(0.36);
+      worker.postMessage({ type: 'build', name: file.name, bytes: buf }, [buf]);
+    });
+  }
+  $('file').addEventListener('change', function () {
+    var f = this.files && this.files[0]; this.value = '';
+    if (!f) return;
+    show('errbox', false); show('last', false); show('pick', false); show('progress', true);
+    $('detail').textContent = ''; startTicker();
+    $('stage').textContent = ready ? 'Reading your file…' : 'Getting ready…'; setBar(null);
+    swReady.then(startWorker);
+    if (ready) { send(f); } else { queued = f; }
+  });
+
+  function openHtml(html, name) {
+    if (blobUrl) { URL.revokeObjectURL(blobUrl); }
+    blobUrl = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+    $('frame').src = blobUrl; $('viewname').textContent = name || '';
+    $('viewer').style.display = 'flex';
+  }
+  $('newfile').addEventListener('click', function () {
+    $('viewer').style.display = 'none'; $('frame').src = 'about:blank';
+    show('progress', false); refreshLast();
+  });
+  function refreshLast() {
+    loadLast().then(function (r) {
+      if (r && r.html) {
+        $('lastinfo').textContent = 'Last dashboard: ' + (r.name || 'file') + ', built ' + new Date(r.when).toLocaleString();
+        show('last', true); $('openlast').onclick = function () { openHtml(r.html, r.name); };
+      } else { show('last', false); }
+    });
+  }
+  refreshLast();
+  swReady.then(startWorker);     // warm up Python while the person picks a file
+  $('stage').textContent = 'Getting ready…'; show('progress', true); setBar(null);
+})();
+</script>
+</body>
+</html>
